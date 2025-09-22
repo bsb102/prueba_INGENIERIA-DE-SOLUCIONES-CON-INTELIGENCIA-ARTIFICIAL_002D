@@ -1,332 +1,1694 @@
-Estructura que sigue el repositorio
+# requirements.txt
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+sentence-transformers==2.2.2
+faiss-cpu==1.7.4
+openai==1.3.0
+numpy==1.24.3
+python-multipart==0.0.6
+python-dotenv==1.0.0
 
-LATAM-AI-CustomerSupport/
-├── README.md
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml
-├── app/
-│ ├── main.py # FastAPI app: endpoints del asistente y health checks
-│ ├── api/ # endpoints REST
-│ │ ├── v1/
-│ │ │ ├── chat.py
-│ │ │ └── status.py
-│ ├── agents/
-│ │ ├── agent_manager.py # Orquestador de agentes
-│ │ └── agents.py # Implementación de agentes (reservas, reclamos...)
-│ ├── embeddings/
-│ │ └── embedder.py # wrapper para generar embeddings (sentence-transformers o OpenAI)
-│ ├── retriever/
-│ │ └── faiss_store.py # indexación y búsqueda (FAISS)
-│ ├── rag/
-│ │ └── rag_chain.py # lógica RAG (retrieval + LLM generation)
-│ ├── data/
-│ │ └── sample_faqs.csv # datos de ejemplo
-│ └── utils/
-│ └── config.py # carga de variables de entorno
-├── ingestion/
-│ └── ingest_faqs.py # script para crear índices desde CSV / docs
-├── tests/
-│ ├── test_retriever.py
-│ └── test_api.py
-├── docs/
-│ ├── design.md
-│ └── test_evidence.md
-└── samples/
-└── conversation_examples.txt
+# ==============================================================================
+# app/utils/config.py
+# ==============================================================================
 
-Codigos usados
-
-from pydantic import BaseSettings
+from typing import Optional
+from pydantic import BaseSettings, Field
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-OPENAI_API_KEY: str = None
-EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
-RAG_TOP_K: int = 5
-FAISS_INDEX_PATH: str = "./app/data/faiss_index.bin"
-PERSIST_DIR: str = "./app/data/faiss_store"
-HOST: str = "0.0.0.0"
-PORT: int = 8000
-
-
-class Config:
-env_file = ".env"
+    OPENAI_API_KEY: Optional[str] = Field(None)
+    OPENAI_MODEL: str = Field("gpt-3.5-turbo")
+    OPENAI_TEMPERATURE: float = Field(0.1, ge=0.0, le=2.0)
+    OPENAI_MAX_TOKENS: int = Field(500, ge=50, le=4000)
+    EMBEDDING_MODEL: str = Field("sentence-transformers/all-MiniLM-L6-v2")
+    RAG_TOP_K: int = Field(5, ge=1, le=20)
+    FAISS_INDEX_PATH: str = Field("./app/data/faiss_index.bin")
+    FAISS_META_PATH: str = Field("./app/data/faiss_index.bin.meta.json")
+    PERSIST_DIR: str = Field("./app/data/faiss_store")
+    CSV_DATA_PATH: str = Field("./app/data/sample_faqs.csv")
+    HOST: str = Field("0.0.0.0")
+    PORT: int = Field(8000, ge=1000, le=65535)
+    LOG_LEVEL: str = Field("INFO")
+    API_KEY: Optional[str] = Field(None)
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+        extra = "ignore"
 
 
 settings = Settings()
 
+# ==============================================================================
+# app/utils/logger.py
+# ==============================================================================
 
-from sentence_transformers import SentenceTransformer
-from typing import List
+import logging
+import sys
+from typing import Optional
 from .config import settings
 
 
-_model = None
+def setup_logger(name: Optional[str] = None) -> logging.Logger:
+    logger_name = name or __name__
+    logger = logging.getLogger(logger_name)
+    
+    if not logger.handlers:
+        formatter = logging.Formatter(
+            fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        logger.setLevel(getattr(logging, settings.LOG_LEVEL))
+    
+    return logger
+
+# ==============================================================================
+# app/utils/exceptions.py
+# ==============================================================================
+
+class RAGException(Exception):
+    pass
 
 
-def get_model():
-global _model
-if _model is None:
-_model = SentenceTransformer(settings.EMBEDDING_MODEL)
-return _model
+class EmbeddingException(RAGException):
+    pass
 
 
+class RetrievalException(RAGException):
+    pass
 
 
-def embed_texts(texts: List[str]):
-model = get_model()
-embeddings = model.encode(texts, show_progress_bar=False)
-return embeddings
+class GenerationException(RAGException):
+    pass
 
+
+class DataLoadException(RAGException):
+    pass
+
+# ==============================================================================
+# app/embeddings/embedder.py
+# ==============================================================================
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from app.utils.config import settings
+from app.utils.logger import setup_logger
+from app.utils.exceptions import EmbeddingException
+
+logger = setup_logger(__name__)
+
+class EmbeddingService:
+    
+    def __init__(self):
+        self._model: Optional[SentenceTransformer] = None
+        self._executor = ThreadPoolExecutor(max_workers=2)
+    
+    def _load_model(self) -> SentenceTransformer:
+        if self._model is None:
+            try:
+                logger.info(f"Cargando modelo: {settings.EMBEDDING_MODEL}")
+                self._model = SentenceTransformer(settings.EMBEDDING_MODEL)
+            except Exception as e:
+                raise EmbeddingException(f"Error cargando modelo: {e}")
+        return self._model
+    
+    def embed_texts(self, texts: List[str]) -> np.ndarray:
+        if not texts:
+            raise EmbeddingException("Lista de textos vacía")
+        
+        if any(not isinstance(text, str) for text in texts):
+            raise EmbeddingException("Todos los elementos deben ser strings")
+        
+        try:
+            model = self._load_model()
+            embeddings = model.encode(
+                texts, 
+                show_progress_bar=False,
+                convert_to_numpy=True
+            )
+            return embeddings
+        except Exception as e:
+            raise EmbeddingException(f"Error generando embeddings: {e}")
+    
+    async def embed_texts_async(self, texts: List[str]) -> np.ndarray:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, self.embed_texts, texts)
+    
+    def get_embedding_dimension(self) -> int:
+        model = self._load_model()
+        try:
+            return model.get_sentence_embedding_dimension()
+        except AttributeError:
+            test_embedding = model.encode(["test"], convert_to_numpy=True)
+            return test_embedding.shape[1]
+    
+    def __del__(self):
+        if hasattr(self, '_executor'):
+            self._executor.shutdown(wait=True)
+
+
+embedding_service = EmbeddingService()
+
+# ==============================================================================
+# app/retriever/faiss_store.py
+# ==============================================================================
 
 import os
+import json
 import numpy as np
 import faiss
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any, Optional
 from app.utils.config import settings
+from app.utils.logger import setup_logger
+from app.utils.exceptions import RetrievalException
+
+logger = setup_logger(__name__)
 
 
 class FaissStore:
-def __init__(self, dim: int, index_path: str = None):
-self.dim = dim
-self.index_path = index_path or settings.FAISS_INDEX_PATH
-self.index = faiss.IndexFlatL2(dim)
-self.docs = [] # metadata list
+    
+    def __init__(self, dim: int, index_path: Optional[str] = None):
+        self.dim = dim
+        self.index_path = index_path or settings.FAISS_INDEX_PATH
+        self.meta_path = self.index_path + '.meta.json'
+        self.index = faiss.IndexFlatL2(dim)
+        self.docs: List[Dict[str, Any]] = []
+    
+    def add(self, embeddings: np.ndarray, metadatas: List[Dict[str, Any]]) -> None:
+        if embeddings.shape[0] != len(metadatas):
+            raise RetrievalException(
+                f"Número de embeddings ({embeddings.shape[0]}) "
+                f"no coincide con metadatos ({len(metadatas)})"
+            )
+        
+        if embeddings.shape[1] != self.dim:
+            raise RetrievalException(
+                f"Dimensión incorrecta: {embeddings.shape[1]} != {self.dim}"
+            )
+        
+        try:
+            embeddings = embeddings.astype('float32')
+            faiss.normalize_L2(embeddings)
+            self.index.add(embeddings)
+            self.docs.extend(metadatas)
+            logger.info(f"Añadidos {len(metadatas)} documentos")
+        except Exception as e:
+            raise RetrievalException(f"Error añadiendo documentos: {e}")
+    
+    def search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[Tuple[Dict[str, Any], float]]:
+        if len(self.docs) == 0:
+            return []
+        
+        try:
+            if query_embedding.ndim == 1:
+                query_embedding = query_embedding.reshape(1, -1)
+            
+            query_embedding = query_embedding.astype('float32')
+            faiss.normalize_L2(query_embedding)
+            
+            effective_k = min(top_k, len(self.docs))
+            scores, indices = self.index.search(query_embedding, effective_k)
+            
+            results = []
+            for score, idx in zip(scores[0], indices[0]):
+                if 0 <= idx < len(self.docs):
+                    results.append((self.docs[idx], float(score)))
+            
+            return results
+        except Exception as e:
+            raise RetrievalException(f"Error en búsqueda: {e}")
+    
+    def save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
+            faiss.write_index(self.index, self.index_path)
+            
+            with open(self.meta_path, 'w', encoding='utf-8') as f:
+                json.dump(self.docs, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"Índice guardado: {self.index_path}")
+        except Exception as e:
+            raise RetrievalException(f"Error guardando índice: {e}")
+    
+    def load(self) -> bool:
+        try:
+            if not os.path.exists(self.index_path) or not os.path.exists(self.meta_path):
+                return False
+            
+            self.index = faiss.read_index(self.index_path)
+            
+            with open(self.meta_path, 'r', encoding='utf-8') as f:
+                self.docs = json.load(f)
+            
+            logger.info(f"Índice cargado: {len(self.docs)} documentos")
+            return True
+        except Exception as e:
+            logger.error(f"Error cargando índice: {e}")
+            return False
+    
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            'total_documents': len(self.docs),
+            'dimension': self.dim,
+            'index_size': self.index.ntotal,
+            'index_path': self.index_path,
+            'meta_path': self.meta_path
+        }
 
-
-def add(self, embeddings: np.ndarray, metadatas: List[dict]):
-if embeddings.ndim == 1:
-embeddings = embeddings.reshape(1, -1)
-self.index.add(embeddings.astype('float32'))
-self.docs.extend(metadatas)
-
-
-def search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[Tuple[dict, float]]:
-if query_embedding.ndim == 1:
-query_embedding = query_embedding.reshape(1, -1)
-D, I = self.index.search(query_embedding.astype('float32'), top_k)
-results = []
-for score, idx in zip(D[0], I[0]):
-if idx < len(self.docs):
-results.append((self.docs[idx], float(score)))
-return results
-
-
-def save(self):
-os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
-faiss.write_index(self.index, self.index_path)
-# store docs metadata
-import json
-with open(self.index_path + '.meta.json', 'w', encoding='utf-8') as f:
-json.dump(self.docs, f, ensure_ascii=False, indent=2)
-
-
-def load(self):
-if os.path.exists(self.index_path):
-self.index = faiss.read_index(self.index_path)
-import json
-with open(self.index_path + '.meta.json', 'r', encoding='utf-8') as f:
-self.docs = json.load(f)
+# ==============================================================================
+# app/data/data_loader.py
+# ==============================================================================
 
 import csv
-import numpy as np
-from app.embeddings.embedder import embed_texts
+import os
+from typing import List, Dict, Any
+from app.utils.config import settings
+from app.utils.logger import setup_logger
+from app.utils.exceptions import DataLoadException
+
+logger = setup_logger(__name__)
+
+
+class DataLoader:
+    
+    def load_faqs_from_csv(self, path: str = None) -> List[Dict[str, Any]]:
+        csv_path = path or settings.CSV_DATA_PATH
+        
+        if not os.path.exists(csv_path):
+            raise DataLoadException(f"Archivo CSV no encontrado: {csv_path}")
+        
+        try:
+            data = []
+            with open(csv_path, newline='', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                
+                required_fields = ['question', 'answer']
+                if not all(field in reader.fieldnames for field in required_fields):
+                    missing = [f for f in required_fields if f not in reader.fieldnames]
+                    raise DataLoadException(f"Faltan columnas: {missing}")
+                
+                for row_num, row in enumerate(reader, 1):
+                    if not row.get('question', '').strip() or not row.get('answer', '').strip():
+                        continue
+                    
+                    clean_row = {
+                        'id': row_num - 1,
+                        'question': row['question'].strip(),
+                        'answer': row['answer'].strip(),
+                        'category': row.get('category', 'general').strip(),
+                    }
+                    data.append(clean_row)
+            
+            logger.info(f"Cargadas {len(data)} FAQs")
+            return data
+        except Exception as e:
+            raise DataLoadException(f"Error cargando FAQs: {e}")
+    
+    def create_sample_csv(self, path: str = None) -> None:
+        csv_path = path or settings.CSV_DATA_PATH
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        
+        sample_data = [
+            {
+                'question': '¿Cuál es el peso máximo permitido para equipaje de mano?',
+                'answer': 'El equipaje de mano puede pesar máximo 8 kg en vuelos nacionales y 10 kg en vuelos internacionales.',
+                'category': 'equipaje'
+            },
+            {
+                'question': '¿Cómo puedo cambiar mi vuelo?',
+                'answer': 'Puedes cambiar tu vuelo a través de nuestro sitio web, aplicación móvil o contactando nuestro call center.',
+                'category': 'reservas'
+            },
+            {
+                'question': '¿Qué documentos necesito para viajar?',
+                'answer': 'Para vuelos nacionales necesitas cédula de identidad. Para internacionales, pasaporte vigente.',
+                'category': 'documentacion'
+            },
+            {
+                'question': '¿Cuánto tiempo antes debo llegar al aeropuerto?',
+                'answer': 'Para vuelos nacionales: 1 hora antes. Para vuelos internacionales: 2-3 horas antes.',
+                'category': 'check-in'
+            },
+            {
+                'question': '¿Cómo puedo hacer web check-in?',
+                'answer': 'Puedes hacer check-in online desde 48 horas hasta 1 hora antes del vuelo a través de nuestra web o app.',
+                'category': 'check-in'
+            }
+        ]
+        
+        try:
+            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['question', 'answer', 'category']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(sample_data)
+            
+            logger.info(f"CSV de ejemplo creado: {csv_path}")
+        except Exception as e:
+            raise DataLoadException(f"Error creando CSV: {e}")
+
+# ==============================================================================
+# app/scripts/build_index.py
+# ==============================================================================
+
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.data.data_loader import DataLoader
+from app.embeddings.embedder import embedding_service
 from app.retriever.faiss_store import FaissStore
+from app.utils.logger import setup_logger
+from app.utils.config import settings
+
+logger = setup_logger(__name__)
 
 
+def build_faiss_index():
+    try:
+        logger.info("Iniciando construcción del índice FAISS")
+        
+        data_loader = DataLoader()
+        
+        if not os.path.exists(settings.CSV_DATA_PATH):
+            data_loader.create_sample_csv()
+        
+        faqs = data_loader.load_faqs_from_csv()
+        
+        if not faqs:
+            logger.error("No se cargaron FAQs")
+            return False
+        
+        logger.info(f"Generando embeddings para {len(faqs)} documentos")
+        texts = [f"Pregunta: {faq['question']}\nRespuesta: {faq['answer']}" for faq in faqs]
+        embeddings = embedding_service.embed_texts(texts)
+        
+        dim = embedding_service.get_embedding_dimension()
+        store = FaissStore(dim=dim)
+        
+        metadatas = []
+        for i, faq in enumerate(faqs):
+            metadata = {
+                'id': i,
+                'question': faq['question'],
+                'answer': faq['answer'],
+                'category': faq.get('category', 'general'),
+                'text': texts[i]
+            }
+            metadatas.append(metadata)
+        
+        store.add(embeddings, metadatas)
+        store.save()
+        
+        stats = store.get_stats()
+        logger.info(f"Índice construido exitosamente: {stats}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error construyendo índice: {e}")
+        return False
 
 
-def load_faqs(path):
-data = []
-with open(path, newline='', encoding='utf-8') as csvfile:
-reader = csv.DictReader(csvfile)
-for row in reader:
-data.append(row)
-return data
+if __name__ == "__main__":
+    success = build_faiss_index()
+    sys.exit(0 if success else 1)
 
+# ==============================================================================
+# app/rag/rag_chain.py
+# ==============================================================================
 
-
-
-def main():
-faqs = load_faqs('app/data/sample_faqs.csv')
-texts = [f"Q: {f['question']}\nA: {f['answer']}" for f in faqs]
-embs = embed_texts(texts)
-dim = embs.shape[1]
-store = FaissStore(dim=dim)
-metadatas = [{'id': i, 'question': f['question'], 'answer': f['answer']} for i, f in enumerate(faqs)]
-store.add(embs, metadatas)
-store.save()
-print('Índice creado con', len(metadatas), 'documentos')
-
-
-if __name__ == '__main__':
-main()
-
-
-from typing import List
-from app.embeddings.embedder import embed_texts
+import asyncio
+from typing import List, Dict, Any, Tuple, Optional
+from openai import OpenAI
+from app.embeddings.embedder import embedding_service
 from app.retriever.faiss_store import FaissStore
 from app.utils.config import settings
-import openai
+from app.utils.logger import setup_logger
+from app.utils.exceptions import GenerationException, RetrievalException
 
-
-openai.api_key = settings.OPENAI_API_KEY
+logger = setup_logger(__name__)
 
 
 class RAGChain:
-def __init__(self, store: FaissStore):
-self.store = store
+    
+    def __init__(self, store: FaissStore):
+        self.store = store
+        self.openai_client: Optional[OpenAI] = None
+        
+        if settings.OPENAI_API_KEY:
+            try:
+                self.openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+                logger.info("Cliente OpenAI inicializado")
+            except Exception as e:
+                logger.error(f"Error inicializando OpenAI: {e}")
+                self.openai_client = None
+    
+    def retrieve(self, question: str, top_k: int = None) -> List[Tuple[Dict[str, Any], float]]:
+        if not question or not question.strip():
+            raise RetrievalException("Pregunta vacía")
+        
+        top_k = top_k or settings.RAG_TOP_K
+        
+        try:
+            query_embedding = embedding_service.embed_texts([question.strip()])[0]
+            results = self.store.search(query_embedding, top_k)
+            return results
+        except Exception as e:
+            raise RetrievalException(f"Error recuperando documentos: {e}")
+    
+    async def retrieve_async(self, question: str, top_k: int = None) -> List[Tuple[Dict[str, Any], float]]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.retrieve, question, top_k)
+    
+    def _build_context(self, context_docs: List[Tuple[Dict[str, Any], float]]) -> str:
+        if not context_docs:
+            return "No se encontró información relevante."
+        
+        context_parts = []
+        for i, (doc, score) in enumerate(context_docs):
+            question = doc.get('question', 'N/A')
+            answer = doc.get('answer', 'N/A')
+            category = doc.get('category', 'general')
+            
+            context_part = f"""Fuente {i+1} [Categoría: {category}, Relevancia: {1-score:.3f}]:
+Pregunta: {question}
+Respuesta: {answer}"""
+            
+            context_parts.append(context_part)
+        
+        return "\n\n".join(context_parts)
+    
+    def _build_prompt(self, question: str, context: str) -> str:
+        return f"""Eres un asistente de atención al cliente de LATAM Airlines. Responde usando ÚNICAMENTE la información de las fuentes.
+
+FUENTES:
+{context}
+
+PREGUNTA: {question}
+
+RESPUESTA:"""
+    
+    def generate_answer(self, question: str, context_docs: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
+        if not context_docs:
+            return {
+                'answer': "Lo siento, no encontré información relevante para responder tu pregunta.",
+                'confidence': 0.0,
+                'method': 'no_context'
+            }
+        
+        context = self._build_context(context_docs)
+        
+        if self.openai_client:
+            try:
+                return self._generate_with_openai(question, context, context_docs)
+            except Exception as e:
+                logger.error(f"Error con OpenAI: {e}")
+                return self._generate_fallback(question, context_docs)
+        else:
+            return self._generate_fallback(question, context_docs)
+    
+    def _generate_with_openai(self, question: str, context: str, context_docs: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
+        try:
+            prompt = self._build_prompt(question, context)
+            
+            response = self.openai_client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "Eres un asistente de LATAM Airlines."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=settings.OPENAI_TEMPERATURE,
+                max_tokens=settings.OPENAI_MAX_TOKENS,
+                timeout=30.0
+            )
+            
+            answer = response.choices[0].message.content.strip()
+            avg_score = sum(score for _, score in context_docs) / len(context_docs)
+            confidence = max(0.0, min(1.0, 1.0 - avg_score))
+            
+            return {
+                'answer': answer,
+                'confidence': confidence,
+                'method': 'openai',
+                'model_used': settings.OPENAI_MODEL,
+                'tokens_used': response.usage.total_tokens if response.usage else 0
+            }
+            
+        except Exception as e:
+            raise GenerationException(f"Error con OpenAI: {e}")
+    
+    def _generate_fallback(self, question: str, context_docs: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
+        if not context_docs:
+            return {
+                'answer': "Lo siento, no encontré información relevante.",
+                'confidence': 0.0,
+                'method': 'fallback_no_docs'
+            }
+        
+        best_doc, best_score = context_docs[0]
+        confidence = max(0.0, min(1.0, 1.0 - best_score))
+        
+        if confidence < 0.3:
+            answer = f"Basado en nuestra información: {best_doc.get('answer', '')}\n\nNota: Te recomiendo contactar directamente para asistencia más detallada."
+        else:
+            answer = best_doc.get('answer', 'No se pudo obtener respuesta.')
+        
+        return {
+            'answer': answer,
+            'confidence': confidence,
+            'method': 'fallback',
+            'source_category': best_doc.get('category', 'general')
+        }
+    
+    async def generate_answer_async(self, question: str, context_docs: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.generate_answer, question, context_docs)
+    
+    def ask(self, question: str, top_k: int = None) -> Dict[str, Any]:
+        try:
+            context_docs = self.retrieve(question, top_k)
+            generation_result = self.generate_answer(question, context_docs)
+            
+            result = {
+                'question': question,
+                'answer': generation_result['answer'],
+                'confidence': generation_result['confidence'],
+                'method': generation_result['method'],
+                'sources': [doc for doc, _ in context_docs],
+                'source_scores': [float(score) for _, score in context_docs],
+                'num_sources': len(context_docs),
+                'success': True,
+                'timestamp': None
+            }
+            
+            if 'model_used' in generation_result:
+                result['model_used'] = generation_result['model_used']
+            if 'tokens_used' in generation_result:
+                result['tokens_used'] = generation_result['tokens_used']
+            if 'source_category' in generation_result:
+                result['source_category'] = generation_result['source_category']
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error procesando pregunta: {e}")
+            return {
+                'question': question,
+                'answer': "Error procesando consulta.",
+                'confidence': 0.0,
+                'method': 'error',
+                'sources': [],
+                'source_scores': [],
+                'num_sources': 0,
+                'success': False,
+                'error': str(e),
+                'timestamp': None
+            }
+    
+    async def ask_async(self, question: str, top_k: int = None) -> Dict[str, Any]:
+        try:
+            context_docs = await self.retrieve_async(question, top_k)
+            generation_result = await self.generate_answer_async(question, context_docs)
+            
+            result = {
+                'question': question,
+                'answer': generation_result['answer'],
+                'confidence': generation_result['confidence'],
+                'method': generation_result['method'],
+                'sources': [doc for doc, _ in context_docs],
+                'source_scores': [float(score) for _, score in context_docs],
+                'num_sources': len(context_docs),
+                'success': True,
+                'timestamp': None
+            }
+            
+            if 'model_used' in generation_result:
+                result['model_used'] = generation_result['model_used']
+            if 'tokens_used' in generation_result:
+                result['tokens_used'] = generation_result['tokens_used']
+            
+            return result
+            
+        except Exception as e:
+            return {
+                'question': question,
+                'answer': "Error procesando consulta.",
+                'confidence': 0.0,
+                'method': 'error',
+                'sources': [],
+                'source_scores': [],
+                'num_sources': 0,
+                'success': False,
+                'error': str(e),
+                'timestamp': None
+            }
+
+# ==============================================================================
+# app/agents/base_agent.py
+# ==============================================================================
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from app.rag.rag_chain import RAGChain
+from app.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
-def retrieve(self, question: str, top_k: int = None):
-top_k = top_k or settings.RAG_TOP_K
-q_emb = embed_texts([question])[0]
-results = self.store.search(q_emb, top_k)
-return results
+class BaseAgent(ABC):
+    
+    def __init__(self, rag_chain: RAGChain, agent_name: str = "base"):
+        self.rag = rag_chain
+        self.agent_name = agent_name
+    
+    @abstractmethod
+    def handle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        pass
+    
+    def _validate_payload(self, payload: Dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            raise ValueError("El payload debe ser un diccionario")
+        
+        question = payload.get('question', '').strip()
+        if not question:
+            raise ValueError("La pregunta no puede estar vacía")
+        
+        return question
+    
+    def _enrich_response(self, response: Dict[str, Any], additional_data: Dict[str, Any] = None) -> Dict[str, Any]:
+        enriched = response.copy()
+        enriched['agent'] = self.agent_name
+        
+        if additional_data:
+            enriched.update(additional_data)
+        
+        return enriched
 
+# ==============================================================================
+# app/agents/reservation_agent.py
+# ==============================================================================
 
-def generate_answer(self, question: str, context_docs: List[dict]):
-# Construir prompt con contexto
-context_text = '\n\n'.join([f"Source {d['id']}: {d.get('question')} - {d.get('answer')}" for d, _ in context_docs])
-prompt = f"Eres un asistente de LATAM con acceso a las siguientes fuentes:\n{context_text}\n\nPregunta: {question}\nRespuesta:"
-# Llamada a LLM (OpenAI GPT-4/GPT-3.5)
-if settings.OPENAI_API_KEY:
-resp = openai.ChatCompletion.create(
-model='gpt-4o-mini' if False else 'gpt-3.5-turbo',
-messages=[{"role": "system", "content": "Eres un asistente útil, preciso y conciso."},
-{"role": "user", "content": prompt}],
-temperature=0.1,
-max_tokens=500
-)
-return resp['choices'][0]['message']['content'].strip()
-else:
-# Fallback: devolver concatenación de respuestas
-combined = '\n\n'.join([d['answer'] for d, _ in context_docs])
-return f"(simulado) Basado en documentos: \n{combined}\n\nRespuesta sugerida a: {question}"
+from typing import Dict, Any
+from .base_agent import BaseAgent
+from app.utils.logger import setup_logger
 
-
-def ask(self, question: str):
-results = self.retrieve(question)
-answer = self.generate_answer(question, results)
-return {
-'question': question,
-'answer': answer,
-'sources': [d for d, _ in results]
-}
-
-
-from typing import Dict
-
-
-class BaseAgent:
-def __init__(self, rag_chain):
-self.rag = rag_chain
-
-
-def handle(self, payload: Dict):
-raise NotImplementedError
+logger = setup_logger(__name__)
 
 
 class ReservationAgent(BaseAgent):
-def handle(self, payload: Dict):
-# payload: {'question': ..., 'user': {...}}
-q = payload.get('question')
-return self.rag.ask(q)
+    
+    def __init__(self, rag_chain):
+        super().__init__(rag_chain, "reservations")
+    
+    def handle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            question = self._validate_payload(payload)
+            enriched_question = self._add_reservation_context(question)
+            response = self.rag.ask(enriched_question)
+            
+            additional_data = {
+                'domain': 'reservations',
+                'suggestions': self._get_reservation_suggestions(question),
+                'next_steps': self._get_reservation_next_steps(question)
+            }
+            
+            return self._enrich_response(response, additional_data)
+            
+        except Exception as e:
+            logger.error(f"Error en ReservationAgent: {e}")
+            return {
+                'question': payload.get('question', ''),
+                'answer': "Error procesando consulta de reserva.",
+                'confidence': 0.0,
+                'success': False,
+                'error': str(e),
+                'agent': self.agent_name,
+                'domain': 'reservations'
+            }
+    
+    def _add_reservation_context(self, question: str) -> str:
+        reservation_keywords = ['cambio', 'modificar', 'reserva', 'vuelo', 'fecha', 'cancelar']
+        
+        if any(keyword in question.lower() for keyword in reservation_keywords):
+            return f"Consulta sobre reservas: {question}"
+        
+        return question
+    
+    def _get_reservation_suggestions(self, question: str) -> list:
+        suggestions = []
+        question_lower = question.lower()
+        
+        if 'cambio' in question_lower or 'modificar' in question_lower:
+            suggestions.extend([
+                "Modificación online hasta 2 horas antes del vuelo",
+                "Cambios pueden tener costo adicional",
+                "Ten tu código de reserva disponible"
+            ])
+        
+        if 'cancelar' in question_lower:
+            suggestions.extend([
+                "Políticas de cancelación varían según tarifa",
+                "Revisa términos y condiciones",
+                "Cancelación gratuita dentro de 24 horas en algunas tarifas"
+            ])
+        
+        if 'check' in question_lower:
+            suggestions.extend([
+                "Check-in online 48 horas antes",
+                "Disponible por web, app o aeropuerto"
+            ])
+        
+        return suggestions[:3]
+    
+    def _get_reservation_next_steps(self, question: str) -> list:
+        question_lower = question.lower()
+        
+        if any(word in question_lower for word in ['cambio', 'modificar', 'cancelar']):
+            return [
+                "1. Accede a 'Administrar Reserva'",
+                "2. Ingresa código de reserva y apellido",
+                "3. Selecciona la opción necesaria"
+            ]
+        
+        return [
+            "1. Visita latam.com",
+            "2. Usa sección 'Ayuda'",
+            "3. Contacta call center si necesitas más ayuda"
+        ]
+
+# ==============================================================================
+# app/agents/claims_agent.py
+# ==============================================================================
+
+from typing import Dict, Any
+from .base_agent import BaseAgent
+from app.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class ClaimsAgent(BaseAgent):
-def handle(self, payload: Dict):
-q = payload.get('question')
-return self.rag.ask(q)
+    
+    def __init__(self, rag_chain):
+        super().__init__(rag_chain, "claims")
+    
+    def handle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            question = self._validate_payload(payload)
+            enriched_question = self._add_claims_context(question)
+            response = self.rag.ask(enriched_question)
+            
+            additional_data = {
+                'domain': 'claims',
+                'claim_types': self._identify_claim_types(question),
+                'required_documents': self._get_required_documents(question),
+                'processing_time': self._get_processing_time(question)
+            }
+            
+            return self._enrich_response(response, additional_data)
+            
+        except Exception as e:
+            logger.error(f"Error en ClaimsAgent: {e}")
+            return {
+                'question': payload.get('question', ''),
+                'answer': "Error procesando consulta de reclamo.",
+                'confidence': 0.0,
+                'success': False,
+                'error': str(e),
+                'agent': self.agent_name,
+                'domain': 'claims'
+            }
+    
+    def _add_claims_context(self, question: str) -> str:
+        claims_keywords = ['reclamo', 'compensación', 'retraso', 'cancelación', 'equipaje', 'perdido']
+        
+        if any(keyword in question.lower() for keyword in claims_keywords):
+            return f"Consulta sobre reclamos: {question}"
+        
+        return question
+    
+    def _identify_claim_types(self, question: str) -> list:
+        question_lower = question.lower()
+        claim_types = []
+        
+        if any(word in question_lower for word in ['retraso', 'demora']):
+            claim_types.append('delay')
+        
+        if 'cancelación' in question_lower or 'cancelado' in question_lower:
+            claim_types.append('cancellation')
+        
+        if any(word in question_lower for word in ['equipaje', 'maleta', 'perdido']):
+            claim_types.append('baggage')
+        
+        if 'overbooking' in question_lower or 'sobreventa' in question_lower:
+            claim_types.append('overbooking')
+        
+        return claim_types if claim_types else ['general']
+    
+    def _get_required_documents(self, question: str) -> list:
+        claim_types = self._identify_claim_types(question)
+        documents = []
+        
+        base_docs = [
+            "Boarding pass",
+            "Documento de identidad",
+            "Código de reserva"
+        ]
+        documents.extend(base_docs)
+        
+        if 'baggage' in claim_types:
+            documents.extend([
+                "Reporte PIR",
+                "Recibos de gastos",
+                "Lista de contenido"
+            ])
+        
+        if 'delay' in claim_types or 'cancellation' in claim_types:
+            documents.extend([
+                "Comprobantes de gastos adicionales",
+                "Certificado médico si aplicable"
+            ])
+        
+        return list(set(documents))
+    
+    def _get_processing_time(self, question: str) -> str:
+        claim_types = self._identify_claim_types(question)
+        
+        if 'baggage' in claim_types:
+            return "15-30 días hábiles"
+        elif any(t in claim_types for t in ['delay', 'cancellation']):
+            return "30-45 días hábiles"
+        else:
+            return "15-30 días hábiles"
+
+# ==============================================================================
+# app/agents/agent_manager.py
+# ==============================================================================
+
+from typing import Dict, Any, Optional
+from .reservation_agent import ReservationAgent
+from .claims_agent import ClaimsAgent
+from app.rag.rag_chain import RAGChain
+from app.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class AgentManager:
-def __init__(self, rag_chain):
-self.rag = rag_chain
-self.agents = {
-'reservations': ReservationAgent(self.rag),
-'claims': ClaimsAgent(self.rag),
-}
+    
+    def __init__(self, rag_chain: RAGChain):
+        self.rag = rag_chain
+        self.agents = {
+            'reservations': ReservationAgent(self.rag),
+            'claims': ClaimsAgent(self.rag),
+        }
+    
+    def get_available_domains(self) -> list:
+        return list(self.agents.keys())
+    
+    def route(self, domain: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            if domain not in self.agents:
+                return {
+                    'error': f'Dominio desconocido: {domain}',
+                    'available_domains': self.get_available_domains(),
+                    'success': False
+                }
+            
+            agent = self.agents[domain]
+            result = agent.handle(payload)
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error en routing: {e}")
+            return {
+                'error': f'Error interno: {str(e)}',
+                'domain': domain,
+                'success': False
+            }
+    
+    def add_agent(self, domain: str, agent) -> None:
+        self.agents[domain] = agent
+    
+    def remove_agent(self, domain: str) -> bool:
+        if domain in self.agents:
+            del self.agents[domain]
+            return True
+        return False
 
+# ==============================================================================
+# app/models/schemas.py
+# ==============================================================================
 
-def route(self, domain: str, payload: Dict):
-agent = self.agents.get(domain, None)
-if agent is None:
-return {'error': 'unknown domain'}
-return agent.handle(payload)
-
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from app.rag.rag_chain import RAGChain
-from app.retriever.faiss_store import FaissStore
-from app.utils.config import settings
-from app.agents.agents import AgentManager
-from app.embeddings.embedder import get_model, embed_texts
-
-
-router = APIRouter()
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field, validator
 
 
 class ChatRequest(BaseModel):
-domain: str = 'reservations'
-question: str
+    domain: str = Field(default='reservations')
+    question: str = Field(..., min_length=1, max_length=1000)
+    user_id: Optional[str] = Field(None)
+    session_id: Optional[str] = Field(None)
+    
+    @validator('question')
+    def validate_question(cls, v):
+        if not v.strip():
+            raise ValueError('La pregunta no puede estar vacía')
+        return v.strip()
+    
+    @validator('domain')
+    def validate_domain(cls, v):
+        valid_domains = ['reservations', 'claims']
+        if v not in valid_domains:
+            raise ValueError(f'Dominio debe ser uno de: {valid_domains}')
+        return v
 
 
-# cargar store en memoria (simplificado)
-_store = None
-_rag = None
-_manager = None
+class SourceDocument(BaseModel):
+    id: int
+    question: str
+    answer: str
+    category: str = Field(default='general')
 
 
-@router.on_event('startup')
-async def startup_event():
-global _store, _rag, _manager
-model = get_model()
-# si el índice existe, cargar
-try:
-# asumimos dim a partir del modelo
-dim = model.get_sentence_embedding_dimension()
-except Exception:
-dim = 384
-_store = FaissStore(dim=dim)
-try:
-_store.load()
-except Exception:
-pass
-_rag = RAGChain(_store)
-_manager = AgentManager(_rag)
+class ChatResponse(BaseModel):
+    question: str
+    answer: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    method: str
+    sources: List[SourceDocument]
+    source_scores: List[float] = Field(default_factory=list)
+    num_sources: int
+    success: bool
+    domain: str
+    agent: str
+    timestamp: datetime
+    
+    model_used: Optional[str] = None
+    tokens_used: Optional[int] = None
+    suggestions: Optional[List[str]] = None
+    next_steps: Optional[List[str]] = None
+    claim_types: Optional[List[str]] = None
+    required_documents: Optional[List[str]] = None
+    processing_time: Optional[str] = None
+    error: Optional[str] = None
 
 
-@router.post('/chat')
-async def chat(req: ChatRequest):
-if not req.question:
-raise HTTPException(status_code=400, detail='question required')
-result = _manager.route(req.domain, {'question': req.question})
-return result
+class HealthResponse(BaseModel):
+    status: str
+    service: str
+    version: str
+    timestamp: datetime
+    components: Dict[str, str]
 
 
-from fastapi import FastAPI
-from app.api.v1.chat import router as chat_router
+class IndexStatsResponse(BaseModel):
+    total_documents: int
+    dimension: int
+    index_size: int
+    index_path: str
+    embedding_model: str
+
+# ==============================================================================
+# app/api/v1/chat.py
+# ==============================================================================
+
+from datetime import datetime
+from typing import Dict, Any, Optional
+from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from app.models.schemas import ChatRequest, ChatResponse, SourceDocument
+from app.utils.config import settings
+from app.utils.logger import setup_logger
+
+router = APIRouter()
+logger = setup_logger(__name__)
+
+security = HTTPBearer(auto_error=False)
 
 
-app = FastAPI(title='LATAM AI CustomerSupport - API')
-app.include_router(chat_router, prefix='/api/v1')
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[str]:
+    if not settings.API_KEY:
+        return None
+    
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token requerido",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    if credentials.credentials != settings.API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    return "authenticated_user"
 
 
-@app.get('/')
-async def root():
-return {'status': 'ok', 'service': 'latam-ai-customer-support'}
+@router.post('/chat', response_model=ChatResponse)
+async def chat(
+    request: ChatRequest, 
+    current_user: Optional[str] = Depends(get_current_user)
+) -> ChatResponse:
+    try:
+        from app.main import get_agent_manager
+        agent_manager = get_agent_manager()
+        
+        if not agent_manager:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Servicio no disponible"
+            )
+        
+        payload = {
+            'question': request.question,
+            'user_id': request.user_id,
+            'session_id': request.session_id
+        }
+        
+        result = agent_manager.route(request.domain, payload)
+        
+        if not result.get('success', False):
+            if 'error' in result and 'Dominio desconocido' in result['error']:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=result['error']
+                )
+        
+        sources = []
+        for source in result.get('sources', []):
+            if isinstance(source, dict):
+                sources.append(SourceDocument(
+                    id=source.get('id', 0),
+                    question=source.get('question', ''),
+                    answer=source.get('answer', ''),
+                    category=source.get('category', 'general')
+                ))
+        
+        response = ChatResponse(
+            question=result.get('question', request.question),
+            answer=result.get('answer', 'No se pudo procesar la consulta'),
+            confidence=result.get('confidence', 0.0),
+            method=result.get('method', 'unknown'),
+            sources=sources,
+            source_scores=result.get('source_scores', []),
+            num_sources=result.get('num_sources', len(sources)),
+            success=result.get('success', False),
+            domain=request.domain,
+            agent=result.get('agent', 'unknown'),
+            timestamp=datetime.now(),
+            model_used=result.get('model_used'),
+            tokens_used=result.get('tokens_used'),
+            suggestions=result.get('suggestions'),
+            next_steps=result.get('next_steps'),
+            claim_types=result.get('claim_types'),
+            required_documents=result.get('required_documents'),
+            processing_time=result.get('processing_time'),
+            error=result.get('error')
+        )
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error en chat endpoint: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error interno del servidor"
+        )
 
 
-from app.embeddings.embedder import embed_texts
+@router.get('/domains')
+async def get_domains(current_user: Optional[str] = Depends(get_current_user)) -> Dict[str, Any]:
+    try:
+        from app.main import get_agent_manager
+        agent_manager = get_agent_manager()
+        
+        if not agent_manager:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Servicio no disponible"
+            )
+        
+        domains = agent_manager.get_available_domains()
+        return {
+            'domains': domains,
+            'default_domain': 'reservations',
+            'total': len(domains)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error obteniendo dominios: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error obteniendo dominios"
+        )
+
+# ==============================================================================
+# app/api/v1/health.py  
+# ==============================================================================
+
+from datetime import datetime
+from fastapi import APIRouter, HTTPException
+from app.models.schemas import HealthResponse, IndexStatsResponse
+from app.utils.config import settings
+from app.utils.logger import setup_logger
+
+router = APIRouter()
+logger = setup_logger(__name__)
+
+
+@router.get('/health', response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    try:
+        components = {}
+        
+        try:
+            from app.main import get_rag_chain
+            rag = get_rag_chain()
+            components['rag'] = 'healthy' if rag else 'unhealthy'
+        except:
+            components['rag'] = 'unhealthy'
+        
+        try:
+            from app.main import get_faiss_store
+            store = get_faiss_store()
+            if store and len(store.docs) > 0:
+                components['faiss_index'] = 'healthy'
+            else:
+                components['faiss_index'] = 'unhealthy'
+        except:
+            components['faiss_index'] = 'unhealthy'
+        
+        if settings.OPENAI_API_KEY:
+            components['openai'] = 'configured'
+        else:
+            components['openai'] = 'not_configured'
+        
+        try:
+            from app.embeddings.embedder import embedding_service
+            embedding_service.get_embedding_dimension()
+            components['embeddings'] = 'healthy'
+        except:
+            components['embeddings'] = 'unhealthy'
+        
+        unhealthy_components = [k for k, v in components.items() if v == 'unhealthy']
+        overall_status = 'unhealthy' if unhealthy_components else 'healthy'
+        
+        return HealthResponse(
+            status=overall_status,
+            service='latam-ai-customer-support',
+            version='1.0.0',
+            timestamp=datetime.now(),
+            components=components
+        )
+        
+    except Exception as e:
+        logger.error(f"Error en health check: {e}")
+        raise HTTPException(status_code=500, detail="Error en health check")
+
+
+@router.get('/stats', response_model=IndexStatsResponse)
+async def get_index_stats() -> IndexStatsResponse:
+    try:
+        from app.main import get_faiss_store
+        store = get_faiss_store()
+        
+        if not store:
+            raise HTTPException(status_code=503, detail="Índice no disponible")
+        
+        stats = store.get_stats()
+        
+        return IndexStatsResponse(
+            total_documents=stats['total_documents'],
+            dimension=stats['dimension'],
+            index_size=stats['index_size'],
+            index_path=stats['index_path'],
+            embedding_model=settings.EMBEDDING_MODEL
+        )
+        
+    except Exception as e:
+        logger.error(f"Error obteniendo estadísticas: {e}")
+        raise HTTPException(status_code=500, detail="Error obteniendo estadísticas")
+
+# ==============================================================================
+# app/main.py
+# ==============================================================================
+
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.api.v1 import chat, health
+from app.rag.rag_chain import RAGChain
 from app.retriever.faiss_store import FaissStore
+from app.agents.agent_manager import AgentManager
+from app.embeddings.embedder import embedding_service
+from app.utils.config import settings
+from app.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+app_state = {}
 
 
+def get_rag_chain():
+    return app_state.get("rag_chain")
 
 
-def test_faiss_basic():
-texts = ['hola me perdi', '¿cual es el equipaje permitido?', 'cambio de vuelo']
-embs = embed_texts(texts)
-store = FaissStore(dim=embs.sha
+def get_faiss_store():
+    return app_state.get("faiss_store")
+
+
+def get_agent_manager():
+    return app_state.get("agent_manager")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Iniciando aplicación...")
+    
+    try:
+        logger.info("Inicializando embeddings...")
+        dim = embedding_service.get_embedding_dimension()
+        
+        logger.info("Inicializando FAISS...")
+        faiss_store = FaissStore(dim=dim)
+        
+        if faiss_store.load():
+            logger.info(f"Índice cargado: {len(faiss_store.docs)} documentos")
+        else:
+            logger.warning("No se pudo cargar índice")
+            try:
+                from app.scripts.build_index import build_faiss_index
+                if build_faiss_index():
+                    faiss_store.load()
+                    logger.info(f"Índice construido: {len(faiss_store.docs)} documentos")
+            except Exception as e:
+                logger.error(f"Error construyendo índice: {e}")
+        
+        logger.info("Inicializando RAG...")
+        rag_chain = RAGChain(faiss_store)
+        
+        logger.info("Inicializando agentes...")
+        agent_manager = AgentManager(rag_chain)
+        
+        app_state.update({
+            "faiss_store": faiss_store,
+            "rag_chain": rag_chain,
+            "agent_manager": agent_manager,
+            "embedding_service": embedding_service
+        })
+        
+        config_status = []
+        
+        if settings.OPENAI_API_KEY:
+            config_status.append("OpenAI configurado")
+        else:
+            config_status.append("OpenAI no configurado (usando fallback)")
+        
+        if len(faiss_store.docs) > 0:
+            config_status.append(f"{len(faiss_store.docs)} documentos indexados")
+        else:
+            config_status.append("Sin documentos indexados")
+        
+        for status in config_status:
+            logger.info(status)
+        
+        logger.info("Aplicación iniciada correctamente")
+        
+    except Exception as e:
+        logger.error(f"Error en inicialización: {e}")
+        raise
+    
+    yield
+    
+    logger.info("Cerrando aplicación...")
+    app_state.clear()
+
+
+app = FastAPI(
+    title="LATAM AI Customer Support",
+    description="Sistema de soporte al cliente con RAG",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(chat.router, prefix="/api/v1", tags=["Chat"])
+app.include_router(health.router, prefix="/api/v1", tags=["Health"])
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": True,
+            "message": exc.detail,
+            "status_code": exc.status_code
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Error no manejado: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": True,
+            "message": "Error interno del servidor",
+            "status_code": 500
+        }
+    )
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "LATAM AI Customer Support",
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/api/v1/health",
+        "endpoints": {
+            "chat": "/api/v1/chat",
+            "domains": "/api/v1/domains",
+            "stats": "/api/v1/stats"
+        }
+    }
+
+# ==============================================================================
+# tests/test_basic.py
+# ==============================================================================
+
+import pytest
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.embeddings.embedder import embedding_service
+from app.retriever.faiss_store import FaissStore
+from app.utils.exceptions import EmbeddingException, RetrievalException
+
+
+class TestEmbeddings:
+    
+    def test_embed_texts_basic(self):
+        texts = ["Hola mundo", "¿Cómo estás?", "Muy bien, gracias"]
+        embeddings = embedding_service.embed_texts(texts)
+        
+        assert embeddings.shape[0] == len(texts)
+        assert embeddings.shape[1] > 0
+    
+    def test_embed_texts_empty_list(self):
+        with pytest.raises(EmbeddingException):
+            embedding_service.embed_texts([])
+    
+    def test_get_dimension(self):
+        dim = embedding_service.get_embedding_dimension()
+        assert isinstance(dim, int)
+        assert dim > 0
+
+
+class TestFaissStore:
+    
+    @pytest.fixture
+    def sample_data(self):
+        texts = ["¿Cuál es el equipaje permitido?", "¿Cómo cambiar mi vuelo?"]
+        embeddings = embedding_service.embed_texts(texts)
+        metadatas = [
+            {"id": 0, "question": texts[0], "answer": "Máximo 23kg", "category": "equipaje"},
+            {"id": 1, "question": texts[1], "answer": "Contacta call center", "category": "reservas"}
+        ]
+        return embeddings, metadatas
+    
+    def test_faiss_store_creation(self):
+        dim = 384
+        store = FaissStore(dim=dim)
+        assert store.dim == dim
+        assert len(store.docs) == 0
+    
+    def test_add_and_search(self, sample_data):
+        embeddings, metadatas = sample_data
+        dim = embeddings.shape[1]
+        
+        store = FaissStore(dim=dim)
+        store.add(embeddings, metadatas)
+        
+        assert len(store.docs) == len(metadatas)
+        
+        query = "equipaje"
+        query_emb = embedding_service.embed_texts([query])[0]
+        results = store.search(query_emb, top_k=1)
+        
+        assert len(results) == 1
+        assert results[0][0]['category'] == 'equipaje'
+
+# ==============================================================================
+# Dockerfile
+# ==============================================================================
+
+FROM python:3.9-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ ./app/
+COPY tests/ ./tests/
+
+RUN mkdir -p /app/data
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# ==============================================================================
+# docker-compose.yml
+# ==============================================================================
+
+version: '3.8'
+
+services:
+  latam-ai-support:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LOG_LEVEL=INFO
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      - ./app/data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# ==============================================================================
+# .env.example
+# ==============================================================================
+
+OPENAI_API_KEY=sk-your-openai-api-key-here
+OPENAI_MODEL=gpt-3.5-turbo
+OPENAI_TEMPERATURE=0.1
+OPENAI_MAX_TOKENS=500
+
+EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+
+RAG_TOP_K=5
+
+FAISS_INDEX_PATH=./app/data/faiss_index.bin
+PERSIST_DIR=./app/data/faiss_store
+CSV_DATA_PATH=./app/data/sample_faqs.csv
+
+HOST=0.0.0.0
+PORT=8000
+
+LOG_LEVEL=INFO
+
+# ==============================================================================
+# run_dev.py
+# ==============================================================================
+
+#!/usr/bin/env python3
+
+import os
+import sys
+import subprocess
+
+def main():
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    os.environ['PYTHONPATH'] = root_dir
+    
+    cmd = [
+        sys.executable, "-m", "uvicorn",
+        "app.main:app",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--reload",
+        "--log-level", "info"
+    ]
+    
+    print("Iniciando servidor...")
+    print(f"URL: http://localhost:8000")
+    print(f"Docs: http://localhost:8000/docs")
+    
+    try:
+        subprocess.run(cmd, cwd=root_dir, check=True)
+    except KeyboardInterrupt:
+        print("Servidor detenido")
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+# ==============================================================================
+# build_index.py
+# ==============================================================================
+
+#!/usr/bin/env python3
+
+import os
+import sys
+
+root_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, root_dir)
+
+from app.scripts.build_index import build_faiss_index
+
+def main():
+    print("Construyendo índice FAISS...")
+    
+    success = build_faiss_index()
+    
+    if success:
+        print("Índice construido exitosamente")
+        return 0
+    else:
+        print("Error construyendo índice")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+# ==============================================================================
+# README.md
+# ==============================================================================
+
+# LATAM AI Customer Support
+
+Sistema de soporte al cliente con RAG para LATAM Airlines.
+
+## Instalación
+
+### Local
+
+```bash
+git clone <repository>
+cd latam-ai-support
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python build_index.py
+python run_dev.py
+```
+
+### Docker
+
+```bash
+cp .env.example .env
+docker-compose up --build
+```
+
+## Uso
+
+### Endpoints
+
+- `POST /api/v1/chat` - Chat principal
+- `GET /api/v1/health` - Estado de salud
+- `GET /api/v1/domains` - Dominios disponibles
+
+### Ejemplo
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/chat" \
+  -H "Content-Type: application/json" \
+  -d '{"domain": "reservations", "question": "¿Cómo cambiar vuelo?"}'
+```
+
+## Configuración
+
+Variables principales en `.env`:
+
+- `OPENAI_API_KEY` - API key de OpenAI (opcional)
+- `EMBEDDING_MODEL` - Modelo de embeddings
+- `RAG_TOP_K` - Número de documentos a recuperar
+
+## Estructura
+
+```
+app/
+├── api/v1/          # Endpoints
+├── agents/          # Agentes especializados
+├── data/            # Datos
+├── embeddings/      # Servicio de embeddings
+├── models/          # Esquemas
+├── rag/             # Sistema RAG
+├── retriever/       # FAISS store
+└── utils/           # Utilidades
+```
+
+## Tests
+
+```bash
+pytest tests/
+```
