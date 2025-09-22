@@ -1,0 +1,332 @@
+Estructura que sigue el repositorio
+
+LATAM-AI-CustomerSupport/
+├── README.md
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── app/
+│ ├── main.py # FastAPI app: endpoints del asistente y health checks
+│ ├── api/ # endpoints REST
+│ │ ├── v1/
+│ │ │ ├── chat.py
+│ │ │ └── status.py
+│ ├── agents/
+│ │ ├── agent_manager.py # Orquestador de agentes
+│ │ └── agents.py # Implementación de agentes (reservas, reclamos...)
+│ ├── embeddings/
+│ │ └── embedder.py # wrapper para generar embeddings (sentence-transformers o OpenAI)
+│ ├── retriever/
+│ │ └── faiss_store.py # indexación y búsqueda (FAISS)
+│ ├── rag/
+│ │ └── rag_chain.py # lógica RAG (retrieval + LLM generation)
+│ ├── data/
+│ │ └── sample_faqs.csv # datos de ejemplo
+│ └── utils/
+│ └── config.py # carga de variables de entorno
+├── ingestion/
+│ └── ingest_faqs.py # script para crear índices desde CSV / docs
+├── tests/
+│ ├── test_retriever.py
+│ └── test_api.py
+├── docs/
+│ ├── design.md
+│ └── test_evidence.md
+└── samples/
+└── conversation_examples.txt
+
+Codigos usados
+
+from pydantic import BaseSettings
+
+
+class Settings(BaseSettings):
+OPENAI_API_KEY: str = None
+EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+RAG_TOP_K: int = 5
+FAISS_INDEX_PATH: str = "./app/data/faiss_index.bin"
+PERSIST_DIR: str = "./app/data/faiss_store"
+HOST: str = "0.0.0.0"
+PORT: int = 8000
+
+
+class Config:
+env_file = ".env"
+
+
+settings = Settings()
+
+
+from sentence_transformers import SentenceTransformer
+from typing import List
+from .config import settings
+
+
+_model = None
+
+
+def get_model():
+global _model
+if _model is None:
+_model = SentenceTransformer(settings.EMBEDDING_MODEL)
+return _model
+
+
+
+
+def embed_texts(texts: List[str]):
+model = get_model()
+embeddings = model.encode(texts, show_progress_bar=False)
+return embeddings
+
+
+import os
+import numpy as np
+import faiss
+from typing import List, Tuple
+from app.utils.config import settings
+
+
+class FaissStore:
+def __init__(self, dim: int, index_path: str = None):
+self.dim = dim
+self.index_path = index_path or settings.FAISS_INDEX_PATH
+self.index = faiss.IndexFlatL2(dim)
+self.docs = [] # metadata list
+
+
+def add(self, embeddings: np.ndarray, metadatas: List[dict]):
+if embeddings.ndim == 1:
+embeddings = embeddings.reshape(1, -1)
+self.index.add(embeddings.astype('float32'))
+self.docs.extend(metadatas)
+
+
+def search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[Tuple[dict, float]]:
+if query_embedding.ndim == 1:
+query_embedding = query_embedding.reshape(1, -1)
+D, I = self.index.search(query_embedding.astype('float32'), top_k)
+results = []
+for score, idx in zip(D[0], I[0]):
+if idx < len(self.docs):
+results.append((self.docs[idx], float(score)))
+return results
+
+
+def save(self):
+os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
+faiss.write_index(self.index, self.index_path)
+# store docs metadata
+import json
+with open(self.index_path + '.meta.json', 'w', encoding='utf-8') as f:
+json.dump(self.docs, f, ensure_ascii=False, indent=2)
+
+
+def load(self):
+if os.path.exists(self.index_path):
+self.index = faiss.read_index(self.index_path)
+import json
+with open(self.index_path + '.meta.json', 'r', encoding='utf-8') as f:
+self.docs = json.load(f)
+
+import csv
+import numpy as np
+from app.embeddings.embedder import embed_texts
+from app.retriever.faiss_store import FaissStore
+
+
+
+
+def load_faqs(path):
+data = []
+with open(path, newline='', encoding='utf-8') as csvfile:
+reader = csv.DictReader(csvfile)
+for row in reader:
+data.append(row)
+return data
+
+
+
+
+def main():
+faqs = load_faqs('app/data/sample_faqs.csv')
+texts = [f"Q: {f['question']}\nA: {f['answer']}" for f in faqs]
+embs = embed_texts(texts)
+dim = embs.shape[1]
+store = FaissStore(dim=dim)
+metadatas = [{'id': i, 'question': f['question'], 'answer': f['answer']} for i, f in enumerate(faqs)]
+store.add(embs, metadatas)
+store.save()
+print('Índice creado con', len(metadatas), 'documentos')
+
+
+if __name__ == '__main__':
+main()
+
+
+from typing import List
+from app.embeddings.embedder import embed_texts
+from app.retriever.faiss_store import FaissStore
+from app.utils.config import settings
+import openai
+
+
+openai.api_key = settings.OPENAI_API_KEY
+
+
+class RAGChain:
+def __init__(self, store: FaissStore):
+self.store = store
+
+
+def retrieve(self, question: str, top_k: int = None):
+top_k = top_k or settings.RAG_TOP_K
+q_emb = embed_texts([question])[0]
+results = self.store.search(q_emb, top_k)
+return results
+
+
+def generate_answer(self, question: str, context_docs: List[dict]):
+# Construir prompt con contexto
+context_text = '\n\n'.join([f"Source {d['id']}: {d.get('question')} - {d.get('answer')}" for d, _ in context_docs])
+prompt = f"Eres un asistente de LATAM con acceso a las siguientes fuentes:\n{context_text}\n\nPregunta: {question}\nRespuesta:"
+# Llamada a LLM (OpenAI GPT-4/GPT-3.5)
+if settings.OPENAI_API_KEY:
+resp = openai.ChatCompletion.create(
+model='gpt-4o-mini' if False else 'gpt-3.5-turbo',
+messages=[{"role": "system", "content": "Eres un asistente útil, preciso y conciso."},
+{"role": "user", "content": prompt}],
+temperature=0.1,
+max_tokens=500
+)
+return resp['choices'][0]['message']['content'].strip()
+else:
+# Fallback: devolver concatenación de respuestas
+combined = '\n\n'.join([d['answer'] for d, _ in context_docs])
+return f"(simulado) Basado en documentos: \n{combined}\n\nRespuesta sugerida a: {question}"
+
+
+def ask(self, question: str):
+results = self.retrieve(question)
+answer = self.generate_answer(question, results)
+return {
+'question': question,
+'answer': answer,
+'sources': [d for d, _ in results]
+}
+
+
+from typing import Dict
+
+
+class BaseAgent:
+def __init__(self, rag_chain):
+self.rag = rag_chain
+
+
+def handle(self, payload: Dict):
+raise NotImplementedError
+
+
+class ReservationAgent(BaseAgent):
+def handle(self, payload: Dict):
+# payload: {'question': ..., 'user': {...}}
+q = payload.get('question')
+return self.rag.ask(q)
+
+
+class ClaimsAgent(BaseAgent):
+def handle(self, payload: Dict):
+q = payload.get('question')
+return self.rag.ask(q)
+
+
+class AgentManager:
+def __init__(self, rag_chain):
+self.rag = rag_chain
+self.agents = {
+'reservations': ReservationAgent(self.rag),
+'claims': ClaimsAgent(self.rag),
+}
+
+
+def route(self, domain: str, payload: Dict):
+agent = self.agents.get(domain, None)
+if agent is None:
+return {'error': 'unknown domain'}
+return agent.handle(payload)
+
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from app.rag.rag_chain import RAGChain
+from app.retriever.faiss_store import FaissStore
+from app.utils.config import settings
+from app.agents.agents import AgentManager
+from app.embeddings.embedder import get_model, embed_texts
+
+
+router = APIRouter()
+
+
+class ChatRequest(BaseModel):
+domain: str = 'reservations'
+question: str
+
+
+# cargar store en memoria (simplificado)
+_store = None
+_rag = None
+_manager = None
+
+
+@router.on_event('startup')
+async def startup_event():
+global _store, _rag, _manager
+model = get_model()
+# si el índice existe, cargar
+try:
+# asumimos dim a partir del modelo
+dim = model.get_sentence_embedding_dimension()
+except Exception:
+dim = 384
+_store = FaissStore(dim=dim)
+try:
+_store.load()
+except Exception:
+pass
+_rag = RAGChain(_store)
+_manager = AgentManager(_rag)
+
+
+@router.post('/chat')
+async def chat(req: ChatRequest):
+if not req.question:
+raise HTTPException(status_code=400, detail='question required')
+result = _manager.route(req.domain, {'question': req.question})
+return result
+
+
+from fastapi import FastAPI
+from app.api.v1.chat import router as chat_router
+
+
+app = FastAPI(title='LATAM AI CustomerSupport - API')
+app.include_router(chat_router, prefix='/api/v1')
+
+
+@app.get('/')
+async def root():
+return {'status': 'ok', 'service': 'latam-ai-customer-support'}
+
+
+from app.embeddings.embedder import embed_texts
+from app.retriever.faiss_store import FaissStore
+
+
+
+
+def test_faiss_basic():
+texts = ['hola me perdi', '¿cual es el equipaje permitido?', 'cambio de vuelo']
+embs = embed_texts(texts)
+store = FaissStore(dim=embs.sha
